@@ -4,50 +4,17 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import Link from "next/link";
 import type { User } from "@supabase/supabase-js";
 import type { BaziPillar, BaziResult, ElementName } from "@/lib/bazi";
+import {
+  fetchCloudRecords,
+  getCloudErrorText,
+  getRecordSummary,
+  toLocalRecord,
+  type BirthRecord,
+  type CloudBaziRecord,
+} from "@/lib/cloud-records";
 import { supabase } from "@/lib/supabase";
 
-type GenderValue = "female" | "male" | "private";
-type TimeModeValue = "standard" | "trueSolar";
 type ViewMode = "select" | "report";
-
-type BirthForm = {
-  name: string;
-  gender: GenderValue;
-  year: string;
-  month: string;
-  day: string;
-  hour: string;
-  minute: string;
-  province: string;
-  city: string;
-  county: string;
-  timeMode: TimeModeValue;
-  note: string;
-};
-
-type BirthRecord = {
-  id: string;
-  createdAt: string;
-  form: BirthForm;
-  result: BaziResult;
-};
-
-type CloudBaziRecord = {
-  id: string;
-  name: string;
-  gender: GenderValue;
-  birth_date: string;
-  birth_time: string;
-  birth_place: string;
-  province: string | null;
-  city: string | null;
-  county: string | null;
-  longitude: number | null;
-  use_true_solar_time: boolean;
-  pillars_result: BaziResult["pillars"];
-  bazi_result: BaziResult;
-  created_at: string;
-};
 
 type CompatibilityRelation = {
   type: string;
@@ -111,66 +78,6 @@ const branchMeetings: Array<{ branches: string[]; element: ElementName }> = [
   { branches: ["申", "酉", "戌"], element: "金" },
   { branches: ["亥", "子", "丑"], element: "水" },
 ];
-
-function getGenderText(value: string) {
-  const labels: Record<string, string> = {
-    female: "女",
-    male: "男",
-    private: "暂不填写",
-  };
-  return labels[value] || value;
-}
-
-function toLocalRecord(record: CloudBaziRecord): BirthRecord {
-  const [year, month, day] = record.birth_date.split("-");
-  const [hour = "00", minute = "00"] = record.birth_time.split(":");
-
-  return {
-    id: record.id,
-    createdAt: record.created_at,
-    form: {
-      name: record.name,
-      gender: record.gender,
-      year,
-      month,
-      day,
-      hour,
-      minute,
-      province: record.province || "",
-      city: record.city || "",
-      county: record.county || "",
-      timeMode: record.use_true_solar_time ? "trueSolar" : "standard",
-      note: "",
-    },
-    result: record.bazi_result,
-  };
-}
-
-function getCloudErrorText(message: string) {
-  if (message.includes("permission denied for schema") || message.includes("permission denied for table")) {
-    return "表已经存在，但当前登录用户没有访问权限。请重新运行 supabase/schema.sql。";
-  }
-
-  if (message.includes("bazi_profiles") || message.includes("relation") || message.includes("schema cache")) {
-    return "云端命盘记录表还没有创建，或接口缓存尚未刷新。请确认已运行 supabase/schema.sql。";
-  }
-
-  if (message.includes("row-level security") || message.includes("violates row-level security")) {
-    return "云端记录权限规则未通过。请重新运行 supabase/schema.sql 里的 RLS policy。";
-  }
-
-  return message;
-}
-
-function getRecordSummary(form: BirthForm) {
-  return {
-    date: `${form.year}-${form.month}-${form.day}`,
-    time: `${form.hour}:${form.minute}`,
-    place: [form.province, form.city, form.county].filter(Boolean).join(" "),
-    genderText: getGenderText(form.gender),
-    timeModeText: form.timeMode === "trueSolar" ? "真太阳时" : "北京时间",
-  };
-}
 
 function getPairKey(left: string, right: string, pairs: string[]) {
   return pairs.find((pair) => pair === `${left}${right}` || pair === `${right}${left}`);
@@ -397,10 +304,7 @@ export default function CompatibilityPage() {
     setIsCloudLoading(true);
     setCloudStatus("");
 
-    const { data, error } = await supabase
-      .from("bazi_profiles")
-      .select("*")
-      .order("created_at", { ascending: false });
+    const { data, error } = await fetchCloudRecords(supabase);
 
     setIsCloudLoading(false);
 
@@ -409,8 +313,8 @@ export default function CompatibilityPage() {
       return;
     }
 
-    setCloudRecords((data || []) as CloudBaziRecord[]);
-    setCloudStatus((data || []).length ? `已读取 ${(data || []).length} 条云端记录。` : "云端记录已连接，当前还没有保存过命盘。");
+    setCloudRecords(data);
+    setCloudStatus(data.length ? `已读取 ${data.length} 条云端记录。` : "云端记录已连接，当前还没有保存过命盘。");
   }, []);
 
   useEffect(() => {

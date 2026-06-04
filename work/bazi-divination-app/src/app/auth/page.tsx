@@ -3,6 +3,7 @@
 import { useEffect, useState } from "react";
 import Link from "next/link";
 import type { User } from "@supabase/supabase-js";
+import { getAuthErrorText } from "@/lib/auth-errors";
 import { isSupabaseConfigured, supabase } from "@/lib/supabase";
 
 export default function AuthPage() {
@@ -58,19 +59,23 @@ export default function AuthPage() {
     setIsSubmitting(true);
     setStatus("正在登录...");
 
-    const { error } = await supabase.auth.signInWithPassword({
-      email: email.trim(),
-      password,
-    });
+    try {
+      const { error } = await supabase.auth.signInWithPassword({
+        email: email.trim(),
+        password,
+      });
 
-    setIsSubmitting(false);
+      if (error) {
+        setStatus(`登录失败：${getAuthErrorText(error.message)}`);
+        return;
+      }
 
-    if (error) {
-      setStatus(`登录失败：${getAuthErrorText(error.message)}`);
-      return;
+      setStatus("登录成功。");
+    } catch (error) {
+      setStatus(`登录失败：${getAuthErrorText(error instanceof Error ? error.message : "网络请求失败")}`);
+    } finally {
+      setIsSubmitting(false);
     }
-
-    setStatus("登录成功。");
   }
 
   async function handleSignUp() {
@@ -81,24 +86,28 @@ export default function AuthPage() {
     setIsSubmitting(true);
     setStatus("正在创建账号...");
 
-    const { data, error } = await supabase.auth.signUp({
-      email: email.trim(),
-      password,
-    });
+    try {
+      const { data, error } = await supabase.auth.signUp({
+        email: email.trim(),
+        password,
+      });
 
-    setIsSubmitting(false);
+      if (error) {
+        setStatus(`注册失败：${getAuthErrorText(error.message)}`);
+        return;
+      }
 
-    if (error) {
-      setStatus(`注册失败：${getAuthErrorText(error.message)}`);
-      return;
+      if (!data.session) {
+        setStatus("账号已创建。若 Supabase 开启了邮箱确认，请先到后台关闭 Confirm email，或打开确认邮件。");
+        return;
+      }
+
+      setStatus("注册成功，已登录。");
+    } catch (error) {
+      setStatus(`注册失败：${getAuthErrorText(error instanceof Error ? error.message : "网络请求失败")}`);
+    } finally {
+      setIsSubmitting(false);
     }
-
-    if (!data.session) {
-      setStatus("账号已创建。若 Supabase 开启了邮箱确认，请先到后台关闭 Confirm email，或打开确认邮件。");
-      return;
-    }
-
-    setStatus("注册成功，已登录。");
   }
 
   async function handleSignOut() {
@@ -108,22 +117,6 @@ export default function AuthPage() {
 
     await supabase.auth.signOut();
     setStatus("已退出登录。");
-  }
-
-  function getAuthErrorText(message: string) {
-    if (message.includes("Invalid login credentials")) {
-      return "邮箱或密码不正确。如果这是刚注册的账号，请确认 Supabase 的 Confirm email 已关闭，或先完成邮箱确认。";
-    }
-
-    if (message.includes("Email not confirmed")) {
-      return "邮箱还没有确认。请关闭 Supabase 的 Confirm email，或先打开确认邮件。";
-    }
-
-    if (message.includes("User already registered")) {
-      return "这个邮箱已经注册过，请直接登录；如果忘记密码，后面需要补重置密码功能。";
-    }
-
-    return message;
   }
 
   return (

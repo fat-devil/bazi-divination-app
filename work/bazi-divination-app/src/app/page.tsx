@@ -6,52 +6,27 @@ import type { User } from "@supabase/supabase-js";
 import hmtData from "china-division/dist/HK-MO-TW.json";
 import pcaData from "china-division/dist/pca.json";
 import { calculateBazi, type BaziPillar, type BaziResult, type ElementName } from "@/lib/bazi";
+import { getAuthErrorText } from "@/lib/auth-errors";
+import {
+  getCloudStatusText,
+  getCloudSuccessText,
+  getGenderText,
+  getRecordFingerprint,
+  getRecordSummary,
+  deleteCloudRecord,
+  fetchCloudRecords,
+  insertCloudRecord,
+  toLocalRecord,
+  type BirthForm,
+  type BirthRecord,
+  type CloudBaziRecord,
+  type GenderValue,
+} from "@/lib/cloud-records";
 import { getApproxLongitude } from "@/lib/location";
 import { isSupabaseConfigured, supabase } from "@/lib/supabase";
 
 type ProvinceMap = Record<string, Record<string, string[]>>;
 type ViewName = "input" | "report" | "records" | "auth" | "compatibility" | "compatibilityReport";
-type GenderValue = "female" | "male" | "private";
-type TimeModeValue = "standard" | "trueSolar";
-
-type BirthForm = {
-  name: string;
-  gender: GenderValue;
-  year: string;
-  month: string;
-  day: string;
-  hour: string;
-  minute: string;
-  province: string;
-  city: string;
-  county: string;
-  timeMode: TimeModeValue;
-  note: string;
-};
-
-type BirthRecord = {
-  id: string;
-  createdAt: string;
-  form: BirthForm;
-  result: BaziResult;
-};
-
-type CloudBaziRecord = {
-  id: string;
-  name: string;
-  gender: GenderValue;
-  birth_date: string;
-  birth_time: string;
-  birth_place: string;
-  province: string | null;
-  city: string | null;
-  county: string | null;
-  longitude: number | null;
-  use_true_solar_time: boolean;
-  pillars_result: BaziResult["pillars"];
-  bazi_result: BaziResult;
-  created_at: string;
-};
 
 type CompatibilityRelation = {
   type: string;
@@ -173,41 +148,6 @@ function normalizeForm(form: BirthForm): BirthForm {
   };
 }
 
-function getGenderText(value: string) {
-  const labels: Record<string, string> = {
-    female: "女",
-    male: "男",
-    private: "暂不填写",
-  };
-
-  return labels[value] || value;
-}
-
-function getRecordSummary(form: BirthForm) {
-  return {
-    date: `${form.year}-${form.month}-${form.day}`,
-    time: `${form.hour}:${form.minute}`,
-    place: [form.province, form.city, form.county].filter(Boolean).join(" "),
-    genderText: getGenderText(form.gender),
-    timeModeText: form.timeMode === "trueSolar" ? "真太阳时" : "北京时间",
-  };
-}
-
-function getRecordFingerprint(form: BirthForm) {
-  return [
-    form.gender,
-    form.year,
-    form.month,
-    form.day,
-    form.hour,
-    form.minute,
-    form.province,
-    form.city,
-    form.county,
-    form.timeMode,
-  ].join("|");
-}
-
 function formatSavedTime(value: string) {
   return new Date(value).toLocaleString("zh-CN", {
     year: "numeric",
@@ -216,51 +156,6 @@ function formatSavedTime(value: string) {
     hour: "2-digit",
     minute: "2-digit",
   });
-}
-
-function getAuthErrorText(message: string) {
-  if (message.includes("Invalid login credentials")) {
-    return "邮箱或密码不正确。如果这是刚注册的账号，请确认 Supabase 的 Confirm email 已关闭，或先完成邮箱确认。";
-  }
-
-  if (message.includes("Email not confirmed")) {
-    return "邮箱还没有确认。请关闭 Supabase 的 Confirm email，或先打开确认邮件。";
-  }
-
-  if (message.includes("User already registered")) {
-    return "这个邮箱已经注册过，请直接登录；如果忘记密码，后面需要补重置密码功能。";
-  }
-
-  return message;
-}
-
-function getCloudErrorText(message: string) {
-  if (message.includes("permission denied for schema") || message.includes("permission denied for table")) {
-    return "表已经存在，但前端登录用户没有访问权限。请重新运行 supabase/schema.sql，重点是 GRANT 和 RLS policy。";
-  }
-
-  if (message.includes("bazi_profiles") || message.includes("relation") || message.includes("schema cache")) {
-    return "云端命盘记录表还没有创建。请到 Supabase 的 SQL Editor 运行项目里的 supabase/schema.sql。";
-  }
-
-  if (message.includes("row-level security") || message.includes("violates row-level security")) {
-    return "云端记录权限规则未通过。请重新运行 supabase/schema.sql 里的 RLS policy。";
-  }
-
-  if (message.includes("JWT") || message.includes("permission denied")) {
-    return "当前登录会话或数据库权限异常。请重新登录，并确认 bazi_profiles 表已启用正确的 RLS policy。";
-  }
-
-  return message;
-}
-
-function getCloudStatusText(action: string, message: string) {
-  const text = getCloudErrorText(message);
-  return `${action}失败：${text}${text === message ? "" : `（原始错误：${message}）`}`;
-}
-
-function getCloudSuccessText(count: number) {
-  return count > 0 ? `已读取 ${count} 条云端记录。` : "云端记录已连接，当前还没有保存过命盘。";
 }
 
 function getPairKey(left: string, right: string, pairs: string[]) {
@@ -407,39 +302,6 @@ function analyzeCompatibility(left: BirthRecord, right: BirthRecord): Compatibil
   };
 }
 
-function getBirthDate(form: BirthForm) {
-  return `${form.year}-${form.month}-${form.day}`;
-}
-
-function getBirthTime(form: BirthForm) {
-  return `${form.hour}:${form.minute}:00`;
-}
-
-function toLocalRecord(record: CloudBaziRecord): BirthRecord {
-  const [year, month, day] = record.birth_date.split("-");
-  const [hour = "00", minute = "00"] = record.birth_time.split(":");
-
-  return {
-    id: record.id,
-    createdAt: record.created_at,
-    form: {
-      name: record.name,
-      gender: record.gender,
-      year,
-      month,
-      day,
-      hour,
-      minute,
-      province: record.province || "",
-      city: record.city || "",
-      county: record.county || "",
-      timeMode: record.use_true_solar_time ? "trueSolar" : "standard",
-      note: "",
-    },
-    result: record.bazi_result,
-  };
-}
-
 function WheelPicker({ label, name, options, value, onChange }: WheelPickerProps) {
   return (
     <div className="min-w-0">
@@ -537,10 +399,7 @@ export default function Home() {
     setIsCloudLoading(true);
     setCloudStatus("");
 
-    const { data, error } = await supabase
-      .from("bazi_profiles")
-      .select("*")
-      .order("created_at", { ascending: false });
+    const { data, error } = await fetchCloudRecords(supabase);
 
     setIsCloudLoading(false);
 
@@ -549,8 +408,8 @@ export default function Home() {
       return;
     }
 
-    setCloudRecords((data || []) as CloudBaziRecord[]);
-    setCloudStatus(getCloudSuccessText((data || []).length));
+    setCloudRecords(data);
+    setCloudStatus(getCloudSuccessText(data.length));
   }, []);
 
   useEffect(() => {
@@ -640,21 +499,11 @@ export default function Home() {
     }
 
     const longitude = getApproxLongitude(nextForm.province);
-    const summary = getRecordSummary(nextForm);
-    const { error } = await supabase.from("bazi_profiles").insert({
-      user_id: user.id,
-      name: nextForm.name,
-      gender: nextForm.gender,
-      birth_date: getBirthDate(nextForm),
-      birth_time: getBirthTime(nextForm),
-      birth_place: summary.place,
-      province: nextForm.province,
-      city: nextForm.city,
-      county: nextForm.county,
+    const { error } = await insertCloudRecord(supabase, {
+      userId: user.id,
+      form: nextForm,
+      result: nextResult,
       longitude,
-      use_true_solar_time: nextForm.timeMode === "trueSolar",
-      pillars_result: nextResult.pillars,
-      bazi_result: nextResult,
     });
 
     if (error) {
@@ -693,19 +542,23 @@ export default function Home() {
     setIsAuthSubmitting(true);
     setAuthStatus("正在登录...");
 
-    const { error } = await supabase.auth.signInWithPassword({
-      email: authEmail.trim(),
-      password: authPassword,
-    });
+    try {
+      const { error } = await supabase.auth.signInWithPassword({
+        email: authEmail.trim(),
+        password: authPassword,
+      });
 
-    setIsAuthSubmitting(false);
+      if (error) {
+        setAuthStatus(`登录失败：${getAuthErrorText(error.message)}`);
+        return;
+      }
 
-    if (error) {
-      setAuthStatus(`登录失败：${getAuthErrorText(error.message)}`);
-      return;
+      setAuthStatus("登录成功。");
+    } catch (error) {
+      setAuthStatus(`登录失败：${getAuthErrorText(error instanceof Error ? error.message : "网络请求失败")}`);
+    } finally {
+      setIsAuthSubmitting(false);
     }
-
-    setAuthStatus("登录成功。");
   }
 
   async function handlePasswordSignUp() {
@@ -716,24 +569,28 @@ export default function Home() {
     setIsAuthSubmitting(true);
     setAuthStatus("正在创建账号...");
 
-    const { data, error } = await supabase.auth.signUp({
-      email: authEmail.trim(),
-      password: authPassword,
-    });
+    try {
+      const { data, error } = await supabase.auth.signUp({
+        email: authEmail.trim(),
+        password: authPassword,
+      });
 
-    setIsAuthSubmitting(false);
+      if (error) {
+        setAuthStatus(`注册失败：${getAuthErrorText(error.message)}`);
+        return;
+      }
 
-    if (error) {
-      setAuthStatus(`注册失败：${getAuthErrorText(error.message)}`);
-      return;
+      if (!data.session) {
+        setAuthStatus("账号已创建。若 Supabase 开启了邮箱确认，请先到后台关闭 Confirm email，或打开确认邮件。");
+        return;
+      }
+
+      setAuthStatus("注册成功，已登录。");
+    } catch (error) {
+      setAuthStatus(`注册失败：${getAuthErrorText(error instanceof Error ? error.message : "网络请求失败")}`);
+    } finally {
+      setIsAuthSubmitting(false);
     }
-
-    if (!data.session) {
-      setAuthStatus("账号已创建。若 Supabase 开启了邮箱确认，请先到后台关闭 Confirm email，或打开确认邮件。");
-      return;
-    }
-
-    setAuthStatus("注册成功，已登录。");
   }
 
   async function handleSignOut() {
@@ -789,7 +646,7 @@ export default function Home() {
       return;
     }
 
-    const { error } = await supabase.from("bazi_profiles").delete().eq("id", recordId);
+    const { error } = await deleteCloudRecord(supabase, recordId);
 
     if (error) {
       setCloudStatus(getCloudStatusText("删除云端记录", error.message));

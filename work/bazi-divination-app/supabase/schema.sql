@@ -11,10 +11,14 @@ create table if not exists public.bazi_profiles (
   county text,
   longitude numeric,
   use_true_solar_time boolean not null default false,
+  profile_fingerprint text,
   pillars_result jsonb not null,
   bazi_result jsonb not null,
   created_at timestamptz not null default now()
 );
+
+alter table public.bazi_profiles
+add column if not exists profile_fingerprint text;
 
 alter table public.bazi_profiles enable row level security;
 
@@ -44,3 +48,7 @@ using (auth.uid() = user_id);
 
 create index if not exists bazi_profiles_user_created_idx
 on public.bazi_profiles (user_id, created_at desc);
+
+create unique index if not exists bazi_profiles_user_fingerprint_key
+on public.bazi_profiles (user_id, profile_fingerprint)
+where profile_fingerprint is not null;

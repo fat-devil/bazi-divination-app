@@ -1,0 +1,22 @@
+{
+  "bazi_users": {
+    "read": false,
+    "write": false
+  },
+  "bazi_sessions": {
+    "read": false,
+    "write": false
+  },
+  "bazi_profiles": {
+    "read": false,
+    "write": false
+  },
+  "bazi_ai_usage": {
+    "read": false,
+    "write": false
+  },
+  "bazi_ai_readings": {
+    "read": false,
+    "write": false
+  }
+}

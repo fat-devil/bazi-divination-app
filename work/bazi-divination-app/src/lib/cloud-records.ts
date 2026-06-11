@@ -1,5 +1,6 @@
 import type { BaziResult } from "@/lib/bazi";
-import type { SupabaseClient } from "@supabase/supabase-js";
+import { getAuthToken } from "@/lib/auth-client";
+import { callCloudBaseFunction, isCloudBaseConfigured } from "@/lib/cloudbase";
 
 export type GenderValue = "female" | "male" | "private";
 export type TimeModeValue = "standard" | "trueSolar";
@@ -28,6 +29,7 @@ export type BirthRecord = {
 
 export type CloudBaziRecord = {
   id: string;
+  _id?: string;
   user_id?: string;
   name: string;
   gender: GenderValue;
@@ -42,24 +44,59 @@ export type CloudBaziRecord = {
   profile_fingerprint?: string | null;
   pillars_result: BaziResult["pillars"];
   bazi_result: BaziResult;
+  ai_reading_content?: string | null;
+  ai_reading_updated_at?: string | null;
   created_at: string;
+};
+
+export type AiReadingTarget = {
+  scope: "single" | "compatibility";
+  profileId?: string;
+  leftProfileId?: string;
+  rightProfileId?: string;
+};
+
+export type CloudAiReading = {
+  id: string;
+  _id?: string;
+  user_id?: string;
+  target_key: string;
+  scope: AiReadingTarget["scope"];
+  profile_id?: string;
+  left_profile_id?: string;
+  right_profile_id?: string;
+  content: string;
+  created_at: string;
+  updated_at: string;
+};
+
+type CloudRecordsResult = {
+  ok?: boolean;
+  record?: CloudBaziRecord;
+  records?: CloudBaziRecord[];
+  reading?: CloudAiReading | null;
+  saved?: boolean;
+  updated?: boolean;
+  error?: string;
 };
 
 export function getGenderText(value: string) {
   const labels: Record<string, string> = {
     female: "女",
     male: "男",
-    private: "暂不填写",
+    private: "未知",
   };
 
   return labels[value] || value;
 }
 
 export function getRecordSummary(form: BirthForm) {
+  const place = [form.province, form.city, form.county].filter(Boolean).join(" ");
+
   return {
     date: `${form.year}-${form.month}-${form.day}`,
     time: `${form.hour}:${form.minute}`,
-    place: [form.province, form.city, form.county].filter(Boolean).join(" "),
+    place: place || "未知",
     genderText: getGenderText(form.gender),
     timeModeText: form.timeMode === "trueSolar" ? "真太阳时" : "北京时间",
   };
@@ -93,7 +130,7 @@ export function toLocalRecord(record: CloudBaziRecord): BirthRecord {
   const [hour = "00", minute = "00"] = record.birth_time.split(":");
 
   return {
-    id: record.id,
+    id: record.id || record._id || "",
     createdAt: record.created_at,
     form: {
       name: record.name,
@@ -114,24 +151,30 @@ export function toLocalRecord(record: CloudBaziRecord): BirthRecord {
 }
 
 export function getCloudErrorText(message: string) {
-  if (message.includes("duplicate key") || message.includes("bazi_profiles_user_fingerprint_key")) {
+  if (message.includes("unauthenticated")) {
+    return "CloudBase 拒绝了前端调用云函数。请检查 Webify 环境变量 NEXT_PUBLIC_CLOUDBASE_ACCESS_KEY 是否配置后重新部署，以及云函数权限是否允许前端调用。";
+  }
+
+  if (message.includes("duplicate key") || message.includes("已保存过")) {
     return "这条命盘已经保存过了，不需要重复保存。";
   }
 
-  if (message.includes("permission denied for schema") || message.includes("permission denied for table")) {
-    return "表已经存在，但前端登录用户没有访问权限。请重新运行 supabase/schema.sql，重点是 GRANT 和 RLS policy。";
+  if (message.includes("ECONNREFUSED") || message.includes("ENOTFOUND") || message.includes("Access denied")) {
+    return "无法连接 CloudBase。请检查环境 ID、Web 安全域名、匿名访问令牌和网络。";
   }
 
-  if (message.includes("bazi_profiles") || message.includes("relation") || message.includes("schema cache")) {
-    return "云端命盘记录表还没有创建。请到 Supabase 的 SQL Editor 运行项目里的 supabase/schema.sql。";
+  if (
+    message.includes("bazi_profiles") ||
+    message.includes("bazi_users") ||
+    message.includes("bazi_sessions") ||
+    message.includes("collection") ||
+    message.includes("not exist")
+  ) {
+    return "CloudBase 集合还没有创建。请创建 bazi_users、bazi_sessions、bazi_profiles 三个集合。";
   }
 
-  if (message.includes("row-level security") || message.includes("violates row-level security")) {
-    return "云端记录权限规则未通过。请重新运行 supabase/schema.sql 里的 RLS policy。";
-  }
-
-  if (message.includes("JWT") || message.includes("permission denied")) {
-    return "当前登录会话或数据库权限异常。请重新登录，并确认 bazi_profiles 表已启用正确的 RLS policy。";
+  if (message.includes("请先登录") || message.includes("登录已过期")) {
+    return "请先登录，再使用云端记录。";
   }
 
   return message;
@@ -146,44 +189,183 @@ export function getCloudSuccessText(count: number) {
   return count > 0 ? `已读取 ${count} 条云端记录。` : "云端记录已连接，当前还没有保存过命盘。";
 }
 
-export async function fetchCloudRecords(supabase: SupabaseClient) {
-  const { data, error } = await supabase
-    .from("bazi_profiles")
-    .select("*")
-    .order("created_at", { ascending: false });
+function getLoginTokenResult() {
+  const token = getAuthToken();
 
-  return { data: (data || []) as CloudBaziRecord[], error };
+  if (!token) {
+    return { token: "", error: { message: "请先登录。" } };
+  }
+
+  return { token, error: null };
 }
 
-export async function deleteCloudRecord(supabase: SupabaseClient, recordId: string) {
-  return supabase.from("bazi_profiles").delete().eq("id", recordId);
+export async function fetchCloudRecords() {
+  if (!isCloudBaseConfigured()) {
+    return { data: [], error: { message: "请先配置 NEXT_PUBLIC_CLOUDBASE_ENV_ID。" } };
+  }
+
+  const { token, error } = getLoginTokenResult();
+
+  if (error) {
+    return { data: [], error };
+  }
+
+  try {
+    const result = await callCloudBaseFunction<CloudRecordsResult>("baziRecords", {
+      action: "list",
+      token,
+    });
+
+    if (!result.ok) {
+      return { data: [], error: { message: result.error || "读取云端记录失败。" } };
+    }
+
+    return { data: result.records || [], error: null };
+  } catch (cloudError) {
+    return { data: [], error: { message: cloudError instanceof Error ? cloudError.message : String(cloudError) } };
+  }
 }
 
-export async function insertCloudRecord(
-  supabase: SupabaseClient,
-  values: {
-    userId: string;
-    form: BirthForm;
-    result: BaziResult;
-    longitude: number;
-  },
-) {
+export async function deleteCloudRecord(recordId: string) {
+  if (!isCloudBaseConfigured()) {
+    return { error: { message: "请先配置 NEXT_PUBLIC_CLOUDBASE_ENV_ID。" } };
+  }
+
+  const { token, error } = getLoginTokenResult();
+
+  if (error) {
+    return { data: null, error };
+  }
+
+  try {
+    const result = await callCloudBaseFunction<CloudRecordsResult>("baziRecords", {
+      action: "delete",
+      token,
+      recordId,
+    });
+
+    if (!result.ok) {
+      return { error: { message: result.error || "删除云端记录失败。" } };
+    }
+
+    return { error: null };
+  } catch (cloudError) {
+    return { error: { message: cloudError instanceof Error ? cloudError.message : String(cloudError) } };
+  }
+}
+
+export async function insertCloudRecord(values: {
+  form: BirthForm;
+  result: BaziResult;
+  longitude: number | null;
+}) {
+  if (!isCloudBaseConfigured()) {
+    return { error: { message: "请先配置 NEXT_PUBLIC_CLOUDBASE_ENV_ID。" } };
+  }
+
+  const { token, error } = getLoginTokenResult();
+
+  if (error) {
+    return { error };
+  }
+
   const summary = getRecordSummary(values.form);
 
-  return supabase.from("bazi_profiles").insert({
-    user_id: values.userId,
-    name: values.form.name,
-    gender: values.form.gender,
-    birth_date: getBirthDate(values.form),
-    birth_time: getBirthTime(values.form),
-    birth_place: summary.place,
-    province: values.form.province,
-    city: values.form.city,
-    county: values.form.county,
-    longitude: values.longitude,
-    use_true_solar_time: values.form.timeMode === "trueSolar",
-    profile_fingerprint: getRecordFingerprint(values.form),
-    pillars_result: values.result.pillars,
-    bazi_result: values.result,
-  });
+  try {
+    const result = await callCloudBaseFunction<CloudRecordsResult>("baziRecords", {
+      action: "create",
+      token,
+      record: {
+        name: values.form.name,
+        gender: values.form.gender,
+        birth_date: getBirthDate(values.form),
+        birth_time: getBirthTime(values.form),
+        birth_place: summary.place,
+        province: values.form.province,
+        city: values.form.city,
+        county: values.form.county,
+        longitude: values.longitude,
+        use_true_solar_time: values.form.timeMode === "trueSolar",
+        profile_fingerprint: getRecordFingerprint(values.form),
+        pillars_result: values.result.pillars,
+        bazi_result: values.result,
+        created_at: new Date().toISOString(),
+      },
+    });
+
+    if (!result.ok) {
+      return { error: { message: result.error || "云端保存失败。" } };
+    }
+
+    return { data: result.record || null, error: null };
+  } catch (cloudError) {
+    return { data: null, error: { message: cloudError instanceof Error ? cloudError.message : String(cloudError) } };
+  }
+}
+
+export async function fetchAiReading(target: AiReadingTarget) {
+  if (!isCloudBaseConfigured()) {
+    return { data: null, error: { message: "请先配置 NEXT_PUBLIC_CLOUDBASE_ENV_ID。" } };
+  }
+
+  const { token, error } = getLoginTokenResult();
+
+  if (error) {
+    return { data: null, error };
+  }
+
+  try {
+    const result = await callCloudBaseFunction<CloudRecordsResult>("baziRecords", {
+      action: "getAiReading",
+      token,
+      target,
+    });
+
+    if (!result.ok) {
+      return { data: null, error: { message: result.error || "读取 AI 解盘失败。" } };
+    }
+
+    return { data: result.reading || null, error: null };
+  } catch (cloudError) {
+    return { data: null, error: { message: cloudError instanceof Error ? cloudError.message : String(cloudError) } };
+  }
+}
+
+export async function upsertAiReading(values: {
+  target: AiReadingTarget;
+  content: string;
+}) {
+  if (!isCloudBaseConfigured()) {
+    return { data: null, error: { message: "请先配置 NEXT_PUBLIC_CLOUDBASE_ENV_ID。" } };
+  }
+
+  const { token, error } = getLoginTokenResult();
+
+  if (error) {
+    return { data: null, error };
+  }
+
+  try {
+    const result = await callCloudBaseFunction<CloudRecordsResult>("baziRecords", {
+      action: "upsertAiReading",
+      token,
+      target: values.target,
+      content: values.content,
+    });
+
+    if (!result.ok) {
+      return { data: null, error: { message: result.error || "保存 AI 解盘失败。" } };
+    }
+
+    return {
+      data: {
+        reading: result.reading || null,
+        saved: Boolean(result.saved),
+        updated: Boolean(result.updated),
+      },
+      error: null,
+    };
+  } catch (cloudError) {
+    return { data: null, error: { message: cloudError instanceof Error ? cloudError.message : String(cloudError) } };
+  }
 }

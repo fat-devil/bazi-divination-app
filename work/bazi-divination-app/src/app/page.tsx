@@ -1,12 +1,18 @@
 ﻿"use client";
 
 import { useCallback, useEffect, useMemo, useState } from "react";
-import Link from "next/link";
-import type { User } from "@supabase/supabase-js";
 import hmtData from "china-division/dist/HK-MO-TW.json";
 import pcaData from "china-division/dist/pca.json";
 import { calculateBazi, type BaziPillar, type BaziResult, type ElementName } from "@/lib/bazi";
 import { getAuthErrorText } from "@/lib/auth-errors";
+import {
+  getCurrentUser,
+  getAuthToken,
+  signInWithPassword,
+  signOut,
+  signUpWithPassword,
+  type AppUser,
+} from "@/lib/auth-client";
 import {
   getCloudStatusText,
   getCloudSuccessText,
@@ -14,16 +20,19 @@ import {
   getRecordFingerprint,
   getRecordSummary,
   deleteCloudRecord,
+  fetchAiReading,
   fetchCloudRecords,
   insertCloudRecord,
   toLocalRecord,
+  upsertAiReading,
+  type AiReadingTarget,
   type BirthForm,
   type BirthRecord,
   type CloudBaziRecord,
   type GenderValue,
 } from "@/lib/cloud-records";
+import { callCloudBaseFunction } from "@/lib/cloudbase";
 import { getApproxLongitude } from "@/lib/location";
-import { isSupabaseConfigured, supabase } from "@/lib/supabase";
 
 type ProvinceMap = Record<string, Record<string, string[]>>;
 type ViewName = "input" | "report" | "records" | "auth" | "compatibility" | "compatibilityReport";
@@ -46,6 +55,22 @@ type CompatibilityAnalysis = {
   spousePalaceRelations: CompatibilityRelation[];
 };
 
+type AiReadingScope = "single" | "compatibility";
+
+type AiReadingState = {
+  scope: AiReadingScope | "";
+  content: string;
+  savedAt: string;
+  status: string;
+};
+
+type AiQuotaState = {
+  dailyLimit: number;
+  remaining: number | null;
+  resetAt: string;
+  isLoading: boolean;
+};
+
 type WheelPickerProps = {
   label: string;
   name: keyof BirthForm;
@@ -55,23 +80,24 @@ type WheelPickerProps = {
 };
 
 const chinaAreas = { ...(pcaData as ProvinceMap), ...(hmtData as ProvinceMap) };
-const provinceOptions = Object.keys(chinaAreas);
+const UNKNOWN_VALUE = "未知";
+const provinceOptions = [UNKNOWN_VALUE, ...Object.keys(chinaAreas)];
 const currentYear = new Date().getFullYear();
-const yearOptions = Array.from({ length: currentYear - 1899 }, (_, index) =>
+const yearOptions = [UNKNOWN_VALUE, ...Array.from({ length: currentYear - 1899 }, (_, index) =>
   String(currentYear - index),
-);
-const monthOptions = Array.from({ length: 12 }, (_, index) =>
+)];
+const monthOptions = [UNKNOWN_VALUE, ...Array.from({ length: 12 }, (_, index) =>
   String(index + 1).padStart(2, "0"),
-);
-const dayOptions = Array.from({ length: 31 }, (_, index) =>
+)];
+const dayOptions = [UNKNOWN_VALUE, ...Array.from({ length: 31 }, (_, index) =>
   String(index + 1).padStart(2, "0"),
-);
-const hourOptions = Array.from({ length: 24 }, (_, index) =>
+)];
+const hourOptions = [UNKNOWN_VALUE, ...Array.from({ length: 24 }, (_, index) =>
   String(index).padStart(2, "0"),
-);
-const minuteOptions = Array.from({ length: 60 }, (_, index) =>
+)];
+const minuteOptions = [UNKNOWN_VALUE, ...Array.from({ length: 60 }, (_, index) =>
   String(index).padStart(2, "0"),
-);
+)];
 const elementOptions: ElementName[] = ["木", "火", "土", "金", "水"];
 const elementGenerates: Record<ElementName, ElementName> = {
   木: "火",
@@ -107,9 +133,9 @@ const branchHarms = ["子未", "丑午", "寅巳", "卯辰", "申亥", "酉戌"]
 const branchBreaks = ["子酉", "卯午", "辰丑", "戌未", "寅亥", "巳申"];
 const branchPunishes = ["子卯", "寅巳", "巳申", "申寅", "丑戌", "戌未", "未丑", "辰辰", "午午", "酉酉", "亥亥"];
 
-const initialProvince = provinceOptions[0] || "";
-const initialCity = Object.keys(chinaAreas[initialProvince] || {})[0] || "";
-const initialCounty = chinaAreas[initialProvince]?.[initialCity]?.[0] || "";
+const initialProvince = provinceOptions[1] || UNKNOWN_VALUE;
+const initialCity = Object.keys(chinaAreas[initialProvince] || {})[0] || UNKNOWN_VALUE;
+const initialCounty = chinaAreas[initialProvince]?.[initialCity]?.[0] || UNKNOWN_VALUE;
 const initialForm: BirthForm = {
   name: "",
   gender: "female",
@@ -128,6 +154,10 @@ const initialForm: BirthForm = {
 const initialBazi = getBaziResult(initialForm);
 
 function getBaziResult(form: BirthForm) {
+  if (!canCalculateBazi(form)) {
+    return createUnknownBaziResult(form);
+  }
+
   return calculateBazi({
     year: form.year,
     month: form.month,
@@ -136,8 +166,71 @@ function getBaziResult(form: BirthForm) {
     minute: form.minute,
     gender: form.gender,
     useTrueSolarTime: form.timeMode === "trueSolar",
-    longitude: getApproxLongitude(form.province),
+    longitude: getApproxLongitude(form.province === UNKNOWN_VALUE ? "" : form.province),
   });
+}
+
+function hasUnknownValue(value: string) {
+  return !value || value === UNKNOWN_VALUE;
+}
+
+function canCalculateBazi(form: BirthForm) {
+  const timeRequired = [form.year, form.month, form.day, form.hour, form.minute];
+
+  if (timeRequired.some(hasUnknownValue)) {
+    return false;
+  }
+
+  if (form.timeMode === "trueSolar" && hasUnknownValue(form.province)) {
+    return false;
+  }
+
+  return true;
+}
+
+function createUnknownPillar(label: string): BaziPillar {
+  return {
+    label,
+    value: UNKNOWN_VALUE,
+    gan: UNKNOWN_VALUE,
+    zhi: UNKNOWN_VALUE,
+    hideGan: [UNKNOWN_VALUE],
+    wuXing: UNKNOWN_VALUE,
+    naYin: UNKNOWN_VALUE,
+    shiShenGan: UNKNOWN_VALUE,
+    shiShenZhi: [UNKNOWN_VALUE],
+    diShi: UNKNOWN_VALUE,
+    xun: UNKNOWN_VALUE,
+    xunKong: UNKNOWN_VALUE,
+  };
+}
+
+function createUnknownBaziResult(form: BirthForm): BaziResult {
+  return {
+    pillars: ["年柱", "月柱", "日柱", "时柱"].map(createUnknownPillar),
+    dayMaster: UNKNOWN_VALUE,
+    dayMasterElement: UNKNOWN_VALUE,
+    relations: [],
+    timeInfo: {
+      mode: form.timeMode === "trueSolar" ? "真太阳时" : "北京时间",
+      displayTime: "信息不足，未生成完整四柱",
+      longitude: canCalculateBazi(form) ? getApproxLongitude(form.province) : 120,
+      offsetMinutes: 0,
+    },
+  };
+}
+
+function getUnknownReason(form: BirthForm) {
+  const missing: string[] = [];
+
+  if (hasUnknownValue(form.year)) missing.push("出生年份");
+  if (hasUnknownValue(form.month)) missing.push("出生月份");
+  if (hasUnknownValue(form.day)) missing.push("出生日期");
+  if (hasUnknownValue(form.hour)) missing.push("出生小时");
+  if (hasUnknownValue(form.minute)) missing.push("出生分钟");
+  if (form.timeMode === "trueSolar" && hasUnknownValue(form.province)) missing.push("出生省份");
+
+  return missing.length ? `存在未知项：${missing.join("、")}。` : "";
 }
 
 function normalizeForm(form: BirthForm): BirthForm {
@@ -156,6 +249,43 @@ function formatSavedTime(value: string) {
     hour: "2-digit",
     minute: "2-digit",
   });
+}
+
+function getNextResetTime(now = new Date()) {
+  const utcTime = now.getTime() + now.getTimezoneOffset() * 60 * 1000;
+  const chinaNow = new Date(utcTime + 8 * 60 * 60 * 1000);
+  const chinaNextMidnight = Date.UTC(
+    chinaNow.getUTCFullYear(),
+    chinaNow.getUTCMonth(),
+    chinaNow.getUTCDate() + 1,
+    0,
+    0,
+    0,
+  );
+
+  return new Date(chinaNextMidnight - 8 * 60 * 60 * 1000).toISOString();
+}
+
+function formatResetCountdown(resetAt: string) {
+  if (!resetAt) {
+    return "每日北京时间 00:00 重置";
+  }
+
+  const diffMs = new Date(resetAt).getTime() - Date.now();
+
+  if (diffMs <= 0) {
+    return "即将重置";
+  }
+
+  const totalMinutes = Math.ceil(diffMs / 60000);
+  const hours = Math.floor(totalMinutes / 60);
+  const minutes = totalMinutes % 60;
+
+  if (hours <= 0) {
+    return `${minutes} 分钟后重置`;
+  }
+
+  return `${hours} 小时 ${minutes} 分钟后重置`;
 }
 
 function getPairKey(left: string, right: string, pairs: string[]) {
@@ -348,6 +478,71 @@ function RelationCards({ emptyText, relations }: { emptyText: string; relations:
   );
 }
 
+function AiReadingPanel({
+  canSave,
+  content,
+  quotaText,
+  isLoading,
+  isSaving,
+  onGenerate,
+  onSave,
+  saveLabel,
+  saveTitle,
+  status,
+}: {
+  canSave: boolean;
+  content: string;
+  quotaText: string;
+  isLoading: boolean;
+  isSaving: boolean;
+  onGenerate: () => void;
+  onSave: () => void;
+  saveLabel: string;
+  saveTitle: string;
+  status: string;
+}) {
+  return (
+    <section className="rounded-lg border border-stone-300 bg-white p-5 shadow-sm">
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <div>
+          <p className="text-sm font-medium text-stone-500">AI 解盘</p>
+          <h2 className="mt-1 text-2xl font-semibold">生成自然语言解读</h2>
+          <p className="mt-2 text-sm leading-6 text-rose-700">{quotaText}</p>
+        </div>
+        <button
+          type="button"
+          onClick={onGenerate}
+          disabled={isLoading}
+          className="h-10 rounded-md bg-stone-950 px-4 text-sm font-semibold text-white transition hover:bg-rose-800 disabled:cursor-not-allowed disabled:bg-stone-300"
+        >
+          {isLoading ? "解盘中..." : content ? "重新 AI 解盘" : "AI 解盘"}
+        </button>
+      </div>
+      <p className="mt-3 text-sm leading-6 text-stone-600">
+        {status || "点击后会把当前排盘要点发送到云函数，由服务端调用模型生成解读。"}
+      </p>
+      {content && (
+        <>
+          <div className="mt-4 flex flex-wrap items-center justify-between gap-3 rounded-md border border-stone-200 bg-stone-50 p-3">
+            <p className="text-sm leading-6 text-stone-600">{saveTitle}</p>
+            <button
+              type="button"
+              onClick={onSave}
+              disabled={!canSave || isSaving}
+              className="h-9 rounded-md border border-stone-300 bg-white px-3 text-sm font-semibold text-stone-800 transition hover:border-rose-500 hover:text-rose-700 disabled:cursor-not-allowed disabled:bg-stone-100 disabled:text-stone-400"
+            >
+              {isSaving ? "保存中..." : saveLabel}
+            </button>
+          </div>
+          <div className="mt-4 whitespace-pre-wrap rounded-md bg-stone-50 p-4 text-sm leading-7 text-stone-800">
+            {content}
+          </div>
+        </>
+      )}
+    </section>
+  );
+}
+
 function navItemClass(isActive: boolean) {
   return isActive
     ? "inline-flex h-10 items-center justify-center rounded-md bg-stone-950 px-2 text-sm font-semibold text-white transition hover:bg-rose-800"
@@ -361,8 +556,8 @@ export default function Home() {
   const [readingResult, setReadingResult] = useState<BaziResult>(initialBazi);
   const [recordSearch, setRecordSearch] = useState("");
   const [saveStatus, setSaveStatus] = useState("排盘结果尚未保存。登录后可手动保存到云端记录。");
-  const [user, setUser] = useState<User | null>(null);
-  const [authEmail, setAuthEmail] = useState("");
+  const [user, setUser] = useState<AppUser | null>(null);
+  const [authAccount, setAuthAccount] = useState("");
   const [authPassword, setAuthPassword] = useState("");
   const [showAuthPassword, setShowAuthPassword] = useState(false);
   const [authStatus, setAuthStatus] = useState("");
@@ -373,13 +568,36 @@ export default function Home() {
   const [compatLeftId, setCompatLeftId] = useState("");
   const [compatRightId, setCompatRightId] = useState("");
   const [compatReportIds, setCompatReportIds] = useState<{ leftId: string; rightId: string } | null>(null);
+  const [aiReading, setAiReading] = useState<AiReadingState>({ scope: "", content: "", savedAt: "", status: "" });
+  const [isAiReadingLoading, setIsAiReadingLoading] = useState(false);
+  const [isAiReadingSaving, setIsAiReadingSaving] = useState(false);
+  const [aiQuota, setAiQuota] = useState<AiQuotaState>({
+    dailyLimit: 10,
+    remaining: null,
+    resetAt: getNextResetTime(),
+    isLoading: false,
+  });
 
-  const supabaseReady = isSupabaseConfigured;
-  const cityOptions = useMemo(() => Object.keys(chinaAreas[form.province] || {}), [form.province]);
-  const countyOptions = useMemo(() => chinaAreas[form.province]?.[form.city] || [], [form.province, form.city]);
+  const cityOptions = useMemo(() => {
+    if (form.province === UNKNOWN_VALUE) {
+      return [UNKNOWN_VALUE];
+    }
+
+    return [UNKNOWN_VALUE, ...Object.keys(chinaAreas[form.province] || {})];
+  }, [form.province]);
+  const countyOptions = useMemo(() => {
+    if (form.province === UNKNOWN_VALUE || form.city === UNKNOWN_VALUE) {
+      return [UNKNOWN_VALUE];
+    }
+
+    return [UNKNOWN_VALUE, ...(chinaAreas[form.province]?.[form.city] || [])];
+  }, [form.province, form.city]);
   const formSummary = getRecordSummary(form);
   const readingSummary = getRecordSummary(readingForm);
   const records = useMemo(() => cloudRecords.map(toLocalRecord), [cloudRecords]);
+  const readingCloudRecord = cloudRecords.find(
+    (record) => getRecordFingerprint(toLocalRecord(record).form) === getRecordFingerprint(readingForm),
+  );
   const visibleCloudRecords = cloudRecords.filter((record) =>
     record.name.toLowerCase().includes(recordSearch.trim().toLowerCase()),
   );
@@ -391,15 +609,18 @@ export default function Home() {
     compatReportLeftRecord && compatReportRightRecord && compatReportLeftRecord.id !== compatReportRightRecord.id
       ? analyzeCompatibility(compatReportLeftRecord, compatReportRightRecord)
       : null;
+  const aiQuotaText = !user
+    ? `登录后可查看 AI 解盘次数，目前 --/${aiQuota.dailyLimit} 次，每日北京时间 00:00 重置。`
+    : aiQuota.isLoading
+      ? `正在读取 AI 解盘次数，目前 --/${aiQuota.dailyLimit} 次。`
+      : typeof aiQuota.remaining === "number"
+        ? `目前 ${aiQuota.remaining}/${aiQuota.dailyLimit} 次，${formatResetCountdown(aiQuota.resetAt)}。`
+        : `目前 --/${aiQuota.dailyLimit} 次，${formatResetCountdown(aiQuota.resetAt)}。`;
   const loadCloudRecords = useCallback(async () => {
-    if (!supabase) {
-      return;
-    }
-
     setIsCloudLoading(true);
     setCloudStatus("");
 
-    const { data, error } = await fetchCloudRecords(supabase);
+    const { data, error } = await fetchCloudRecords();
 
     setIsCloudLoading(false);
 
@@ -412,33 +633,54 @@ export default function Home() {
     setCloudStatus(getCloudSuccessText(data.length));
   }, []);
 
-  useEffect(() => {
-    if (!supabaseReady || !supabase) {
+  const loadAiQuota = useCallback(async () => {
+    if (!getAuthToken()) {
+      setAiQuota((current) => ({
+        ...current,
+        remaining: null,
+        resetAt: getNextResetTime(),
+        isLoading: false,
+      }));
       return;
     }
 
-    supabase.auth.getUser().then(({ data }) => {
+    setAiQuota((current) => ({ ...current, isLoading: true }));
+
+    try {
+      const result = await callCloudBaseFunction<{
+        ok?: boolean;
+        dailyLimit?: number;
+        remaining?: number;
+        resetAt?: string;
+      }>("baziAi", {
+        action: "usage",
+        token: getAuthToken(),
+      });
+
+      setAiQuota({
+        dailyLimit: result.dailyLimit || 10,
+        remaining: typeof result.remaining === "number" ? result.remaining : null,
+        resetAt: result.resetAt || getNextResetTime(),
+        isLoading: false,
+      });
+    } catch {
+      setAiQuota((current) => ({
+        ...current,
+        resetAt: getNextResetTime(),
+        isLoading: false,
+      }));
+    }
+  }, []);
+
+  useEffect(() => {
+    getCurrentUser().then(({ data }) => {
       setUser(data.user);
       if (data.user) {
         loadCloudRecords();
+        loadAiQuota();
       }
     });
-
-    const { data } = supabase.auth.onAuthStateChange((_event, session) => {
-      const nextUser = session?.user ?? null;
-      setUser(nextUser);
-
-      if (nextUser) {
-        loadCloudRecords();
-      } else {
-        setCloudRecords([]);
-      }
-    });
-
-    return () => {
-      data.subscription.unsubscribe();
-    };
-  }, [loadCloudRecords, supabaseReady]);
+  }, [loadAiQuota, loadCloudRecords]);
 
   useEffect(() => {
     const syncHashView = () => {
@@ -461,13 +703,23 @@ export default function Home() {
   }
 
   function updateProvince(province: string) {
-    const nextCity = Object.keys(chinaAreas[province] || {})[0] || "";
-    const nextCounty = chinaAreas[province]?.[nextCity]?.[0] || "";
+    if (province === UNKNOWN_VALUE) {
+      setForm((current) => ({ ...current, province, city: UNKNOWN_VALUE, county: UNKNOWN_VALUE }));
+      return;
+    }
+
+    const nextCity = Object.keys(chinaAreas[province] || {})[0] || UNKNOWN_VALUE;
+    const nextCounty = chinaAreas[province]?.[nextCity]?.[0] || UNKNOWN_VALUE;
     setForm((current) => ({ ...current, province, city: nextCity, county: nextCounty }));
   }
 
   function updateCity(city: string) {
-    const nextCounty = chinaAreas[form.province]?.[city]?.[0] || "";
+    if (city === UNKNOWN_VALUE) {
+      setForm((current) => ({ ...current, city, county: UNKNOWN_VALUE }));
+      return;
+    }
+
+    const nextCounty = chinaAreas[form.province]?.[city]?.[0] || UNKNOWN_VALUE;
     setForm((current) => ({ ...current, city, county: nextCounty }));
   }
 
@@ -494,17 +746,18 @@ export default function Home() {
   }
 
   async function saveCloudRecord(nextForm: BirthForm, nextResult: BaziResult) {
-    if (!supabase || !user) {
+    if (!user) {
       return;
     }
 
-    const longitude = getApproxLongitude(nextForm.province);
-    const { error } = await insertCloudRecord(supabase, {
-      userId: user.id,
+    const longitude = hasUnknownValue(nextForm.province) ? null : getApproxLongitude(nextForm.province);
+    const saveResult = await insertCloudRecord({
       form: nextForm,
       result: nextResult,
       longitude,
     });
+    const data = "data" in saveResult ? saveResult.data : null;
+    const { error } = saveResult;
 
     if (error) {
       setSaveStatus(getCloudStatusText("云端保存", error.message));
@@ -512,17 +765,16 @@ export default function Home() {
     }
 
     setSaveStatus("已保存到你的云端命盘记录。");
-    loadCloudRecords();
+    if (data) {
+      setCloudRecords((current) => [data, ...current]);
+    } else {
+      loadCloudRecords();
+    }
   }
 
   function validateAuthForm() {
-    if (!supabase) {
-      setAuthStatus("请先配置 Supabase 环境变量。");
-      return false;
-    }
-
-    if (!authEmail.trim()) {
-      setAuthStatus("请先输入邮箱。");
+    if (!authAccount.trim()) {
+      setAuthStatus("请先输入账号。");
       return false;
     }
 
@@ -535,7 +787,7 @@ export default function Home() {
   }
 
   async function handlePasswordSignIn() {
-    if (!validateAuthForm() || !supabase) {
+    if (!validateAuthForm()) {
       return;
     }
 
@@ -543,8 +795,8 @@ export default function Home() {
     setAuthStatus("正在登录...");
 
     try {
-      const { error } = await supabase.auth.signInWithPassword({
-        email: authEmail.trim(),
+      const { data, error } = await signInWithPassword({
+        account: authAccount.trim(),
         password: authPassword,
       });
 
@@ -553,6 +805,9 @@ export default function Home() {
         return;
       }
 
+      setUser(data.user);
+      loadCloudRecords();
+      loadAiQuota();
       setAuthStatus("登录成功。");
     } catch (error) {
       setAuthStatus(`登录失败：${getAuthErrorText(error instanceof Error ? error.message : "网络请求失败")}`);
@@ -562,7 +817,7 @@ export default function Home() {
   }
 
   async function handlePasswordSignUp() {
-    if (!validateAuthForm() || !supabase) {
+    if (!validateAuthForm()) {
       return;
     }
 
@@ -570,8 +825,8 @@ export default function Home() {
     setAuthStatus("正在创建账号...");
 
     try {
-      const { data, error } = await supabase.auth.signUp({
-        email: authEmail.trim(),
+      const { data, error } = await signUpWithPassword({
+        account: authAccount.trim(),
         password: authPassword,
       });
 
@@ -580,11 +835,9 @@ export default function Home() {
         return;
       }
 
-      if (!data.session) {
-        setAuthStatus("账号已创建。若 Supabase 开启了邮箱确认，请先到后台关闭 Confirm email，或打开确认邮件。");
-        return;
-      }
-
+      setUser(data.user);
+      loadCloudRecords();
+      loadAiQuota();
       setAuthStatus("注册成功，已登录。");
     } catch (error) {
       setAuthStatus(`注册失败：${getAuthErrorText(error instanceof Error ? error.message : "网络请求失败")}`);
@@ -594,13 +847,16 @@ export default function Home() {
   }
 
   async function handleSignOut() {
-    if (!supabase) {
-      return;
-    }
-
-    await supabase.auth.signOut();
+    await signOut();
+    setUser(null);
     setAuthStatus("已退出登录。");
     setCloudRecords([]);
+    setAiQuota({
+      dailyLimit: 10,
+      remaining: null,
+      resetAt: getNextResetTime(),
+      isLoading: false,
+    });
   }
 
   function handleGenerate() {
@@ -609,15 +865,18 @@ export default function Home() {
     setReadingForm(nextForm);
     setReadingResult(nextResult);
     setSaveStatus(
-      user
-        ? "排盘结果已生成。点击保存命盘后，才会写入云端记录。"
-        : "排盘结果已生成。请先登录，再手动保存到云端记录。",
+      canCalculateBazi(nextForm)
+        ? user
+          ? "排盘结果已生成。点击保存命盘后，才会写入云端记录。"
+          : "排盘结果已生成。请先登录，再手动保存到云端记录。"
+        : `${getUnknownReason(nextForm)} 当前按不完整信息保存和展示，完整四柱需补齐后再排盘。`,
     );
+    setAiReading({ scope: "single", content: "", savedAt: "", status: "" });
     showView("report");
   }
 
   async function handleSaveRecord() {
-    if (!supabase || !user) {
+    if (!user) {
       setSaveStatus("请先登录，再保存到云端记录。");
       return;
     }
@@ -638,15 +897,17 @@ export default function Home() {
     setReadingForm(localRecord.form);
     setReadingResult(localRecord.result);
     setSaveStatus("当前排盘来自你的云端命盘记录。");
+    setAiReading({ scope: "single", content: "", savedAt: "", status: "" });
     showView("report");
+    loadSavedAiReading("single", { scope: "single", profileId: record.id });
   }
 
   async function handleDeleteCloudRecord(recordId: string) {
-    if (!supabase || !user) {
+    if (!user) {
       return;
     }
 
-    const { error } = await deleteCloudRecord(supabase, recordId);
+    const { error } = await deleteCloudRecord(recordId);
 
     if (error) {
       setCloudStatus(getCloudStatusText("删除云端记录", error.message));
@@ -663,11 +924,171 @@ export default function Home() {
     }
 
     setCompatReportIds({ leftId: compatLeftRecord.id, rightId: compatRightRecord.id });
+    setAiReading({ scope: "compatibility", content: "", savedAt: "", status: "" });
     showView("compatibilityReport");
+    loadSavedAiReading("compatibility", {
+      scope: "compatibility",
+      leftProfileId: compatLeftRecord.id,
+      rightProfileId: compatRightRecord.id,
+    });
+  }
+
+  function getAiReadingTarget(scope: AiReadingScope): AiReadingTarget | null {
+    if (scope === "single") {
+      return readingCloudRecord ? { scope, profileId: readingCloudRecord.id } : null;
+    }
+
+    if (!compatReportLeftRecord || !compatReportRightRecord) {
+      return null;
+    }
+
+    return {
+      scope,
+      leftProfileId: compatReportLeftRecord.id,
+      rightProfileId: compatReportRightRecord.id,
+    };
+  }
+
+  async function loadSavedAiReading(scope: AiReadingScope, targetOverride?: AiReadingTarget) {
+    const target = targetOverride || getAiReadingTarget(scope);
+
+    if (!target) {
+      return;
+    }
+
+    const { data, error } = await fetchAiReading(target);
+
+    if (error || !data) {
+      return;
+    }
+
+    setAiReading({
+      scope,
+      content: data.content,
+      savedAt: data.updated_at,
+      status: `已读取保存过的 AI 解盘，更新于 ${formatSavedTime(data.updated_at)}。`,
+    });
+  }
+
+  async function handleSaveAiReading(scope: AiReadingScope) {
+    if (!aiReading.content || aiReading.scope !== scope) {
+      return;
+    }
+
+    const target = getAiReadingTarget(scope);
+
+    if (!target) {
+      setAiReading((current) => ({
+        ...current,
+        status: scope === "single" ? "请先保存当前命盘，再保存 AI 解盘。" : "合盘 AI 解盘需要两条已保存的命盘记录。",
+      }));
+      return;
+    }
+
+    setIsAiReadingSaving(true);
+
+    const { data, error } = await upsertAiReading({
+      target,
+      content: aiReading.content,
+    });
+
+    setIsAiReadingSaving(false);
+
+    if (error || !data?.reading) {
+      setAiReading((current) => ({
+        ...current,
+        status: `AI 解盘保存失败：${error?.message || "请稍后重试。"}`,
+      }));
+      return;
+    }
+
+    setAiReading((current) => ({
+      ...current,
+      savedAt: data.reading!.updated_at,
+      status: data.saved
+        ? `AI 解盘已保存，保存于 ${formatSavedTime(data.reading!.updated_at)}。`
+        : `AI 解盘已更新，更新于 ${formatSavedTime(data.reading!.updated_at)}。`,
+    }));
+  }
+
+  async function handleAiReading(scope: AiReadingScope) {
+    const currentSavedAt = aiReading.scope === scope ? aiReading.savedAt : "";
+
+    setIsAiReadingLoading(true);
+    setAiReading({ scope, content: "", savedAt: currentSavedAt, status: "正在请求 AI 解盘..." });
+
+    const payload =
+      scope === "single"
+        ? {
+            profile: {
+              form: readingForm,
+              summary: readingSummary,
+              result: readingResult,
+            },
+          }
+        : {
+            left: compatReportLeftRecord,
+            right: compatReportRightRecord,
+            analysis: compatibilityAnalysis,
+          };
+
+    try {
+      const result = await callCloudBaseFunction<{
+        ok?: boolean;
+        content?: string;
+        error?: string;
+        dailyLimit?: number;
+        remaining?: number;
+        resetAt?: string;
+      }>("baziAi", {
+        action: "reading",
+        token: getAuthToken(),
+        scope,
+        payload,
+      });
+
+      if (typeof result.dailyLimit === "number" || typeof result.remaining === "number" || result.resetAt) {
+        setAiQuota({
+          dailyLimit: result.dailyLimit || 10,
+          remaining: typeof result.remaining === "number" ? result.remaining : null,
+          resetAt: result.resetAt || getNextResetTime(),
+          isLoading: false,
+        });
+      }
+
+      if (!result.ok || !result.content) {
+        const usageText =
+          typeof result.remaining === "number" && typeof result.dailyLimit === "number"
+            ? `今日剩余 ${result.remaining}/${result.dailyLimit} 次。`
+            : "";
+        setAiReading({
+          scope,
+          content: "",
+          savedAt: currentSavedAt,
+          status: `${result.error || "AI 解盘失败，请稍后重试。"}${usageText}`,
+        });
+        return;
+      }
+
+      const usageText =
+        typeof result.remaining === "number" && typeof result.dailyLimit === "number"
+          ? `今日剩余 ${result.remaining}/${result.dailyLimit} 次。`
+          : "";
+      setAiReading({ scope, content: result.content, savedAt: currentSavedAt, status: `AI 解盘已生成。${usageText}` });
+    } catch (error) {
+      setAiReading({
+        scope,
+        content: "",
+        savedAt: currentSavedAt,
+        status: error instanceof Error ? `AI 解盘失败：${error.message}` : "AI 解盘失败，请稍后重试。",
+      });
+    } finally {
+      setIsAiReadingLoading(false);
+    }
   }
 
   return (
-    <main className="min-h-screen bg-[#f6f2ea] text-stone-950">
+    <main className="min-h-screen bg-[#f8fafc] text-stone-950">
       <nav className="mx-auto grid w-full max-w-5xl grid-cols-4 gap-2 px-5 pt-5 md:px-8">
         <button
           type="button"
@@ -683,18 +1104,20 @@ export default function Home() {
         >
           我的记录
         </button>
-        <Link
-          href="/compatibility"
-          className={navItemClass(false)}
+        <button
+          type="button"
+          onClick={() => showView("compatibility")}
+          className={navItemClass(view === "compatibility" || view === "compatibilityReport")}
         >
           合盘分析
-        </Link>
-        <Link
-          href="/auth"
+        </button>
+        <button
+          type="button"
+          onClick={() => showView("auth")}
           className={navItemClass(view === "auth")}
         >
           {user ? "账户" : "登录"}
-        </Link>
+        </button>
       </nav>
 
       {view === "auth" && (
@@ -705,15 +1128,10 @@ export default function Home() {
           </header>
 
           <section className="rounded-lg border border-stone-300 bg-white p-5 shadow-sm">
-            {!isSupabaseConfigured ? (
-              <div className="rounded-md border border-dashed border-stone-300 p-5 text-sm leading-6 text-stone-600">
-                还没有配置 Supabase。请根据 `.env.local.example` 填写 `NEXT_PUBLIC_SUPABASE_URL` 和
-                `NEXT_PUBLIC_SUPABASE_ANON_KEY`。
-              </div>
-            ) : user ? (
+            {user ? (
               <div className="grid gap-4">
                 <div className="rounded-md bg-stone-50 p-4 text-sm leading-6 text-stone-700">
-                  当前已登录：<span className="font-semibold text-stone-950">{user.email}</span>
+                  当前已登录：<span className="font-semibold text-stone-950">{user.account}</span>
                 </div>
                 <button
                   type="button"
@@ -726,12 +1144,12 @@ export default function Home() {
             ) : (
               <div className="grid gap-4">
                 <label className="grid gap-2 text-sm font-medium text-stone-700">
-                  邮箱
+                  账号
                   <input
-                    type="email"
-                    value={authEmail}
-                    onChange={(event) => setAuthEmail(event.target.value)}
-                    placeholder="you@example.com"
+                    type="text"
+                    value={authAccount}
+                    onChange={(event) => setAuthAccount(event.target.value)}
+                    placeholder="例如 1302162670@qq.com"
                     className="h-11 rounded-md border border-stone-300 px-3 text-base outline-none transition focus:border-rose-500"
                   />
                 </label>
@@ -777,7 +1195,7 @@ export default function Home() {
                 </div>
 
                 <p className="text-sm leading-6 text-stone-600">
-                  当前使用 Supabase 邮箱密码登录，不再发送魔法链接邮件。
+                  当前使用 CloudBase 登录，云端记录保存到 CloudBase 数据库。
                 </p>
               </div>
             )}
@@ -789,12 +1207,12 @@ export default function Home() {
       {view === "input" && (
         <section className="mx-auto w-full max-w-4xl px-5 py-8 md:px-8 md:py-10">
           <header className="mb-8">
-            <p className="text-sm font-medium text-rose-700">八字排盘 MVP</p>
+            <p className="text-sm font-medium text-rose-700">八字排盘作品</p>
             <h1 className="mt-3 max-w-2xl text-4xl font-semibold leading-tight tracking-normal md:text-5xl">
-              输入出生信息，生成高准确度排盘。
+              输入出生信息，生成清晰可信的八字排盘。
             </h1>
             <p className="mt-5 max-w-2xl text-base leading-7 text-stone-700">
-              当前版本只展示固定规则可推导的排盘结果，减少推断性分析，优先保证准确性。
+              支持真太阳时、云端命盘、合盘分析与 AI 解读；固定规则部分只展示可推导结果，优先保证准确性。
             </p>
           </header>
 
@@ -821,7 +1239,7 @@ export default function Home() {
                 >
                   <option value="female">女</option>
                   <option value="male">男</option>
-                  <option value="private">暂不填写</option>
+                  <option value="private">未知</option>
                 </select>
               </label>
             </div>
@@ -954,8 +1372,12 @@ export default function Home() {
                 <p>排盘时间：<span>{readingResult.timeInfo.displayTime}</span></p>
                 <p className="sm:col-span-2">备注：<span>{readingForm.note || "未填写"}</span></p>
                 <p>
-                  经度校正：<span>{readingResult.timeInfo.longitude.toFixed(1)}°E</span>，
-                  <span>{readingResult.timeInfo.offsetMinutes} 分钟</span>
+                  经度校正：
+                  <span>
+                    {readingForm.timeMode === "trueSolar" && hasUnknownValue(readingForm.province)
+                      ? " 出生省份未知，未完成真太阳时校正"
+                      : ` ${readingResult.timeInfo.longitude.toFixed(1)}°E，${readingResult.timeInfo.offsetMinutes} 分钟`}
+                  </span>
                 </p>
               </div>
             </section>
@@ -977,7 +1399,31 @@ export default function Home() {
               <p className="mt-3 text-sm leading-6 text-stone-600">{saveStatus}</p>
             </section>
 
+            <AiReadingPanel
+              canSave={Boolean(readingCloudRecord)}
+              content={aiReading.scope === "single" ? aiReading.content : ""}
+              quotaText={aiQuotaText}
+              isLoading={isAiReadingLoading && aiReading.scope === "single"}
+              isSaving={isAiReadingSaving && aiReading.scope === "single"}
+              onGenerate={() => handleAiReading("single")}
+              onSave={() => handleSaveAiReading("single")}
+              saveLabel={aiReading.scope === "single" && aiReading.savedAt ? "更新 AI 解盘" : "保存 AI 解盘"}
+              saveTitle={
+                readingCloudRecord
+                  ? aiReading.scope === "single" && aiReading.savedAt
+                    ? `已保存过 AI 解盘，最近更新于 ${formatSavedTime(aiReading.savedAt)}。`
+                    : "当前命盘已保存，可以保存这次 AI 解盘。"
+                  : "请先保存当前命盘，再保存 AI 解盘。"
+              }
+              status={aiReading.scope === "single" ? aiReading.status : ""}
+            />
+
             <section className="rounded-lg border border-stone-300 bg-white p-5 shadow-sm">
+              {!canCalculateBazi(readingForm) && (
+                <div className="mb-4 rounded-md border border-amber-200 bg-amber-50 p-4 text-sm leading-6 text-amber-900">
+                  {getUnknownReason(readingForm)} 当前只展示“未知信息命盘”占位结果，补齐出生年月日时和真太阳时所需省份后，才能生成完整四柱。
+                </div>
+              )}
               <div className="rounded-md border border-rose-100 bg-rose-50 p-4 text-sm leading-6 text-rose-900">
                 日主：<span>{readingResult.dayMaster}</span>，<span>{readingResult.dayMasterElement}</span>
               </div>
@@ -1244,6 +1690,11 @@ export default function Home() {
 
           <div className="grid gap-5">
             <section className="rounded-lg border border-stone-300 bg-white p-5 shadow-sm">
+              {(!canCalculateBazi(compatReportLeftRecord.form) || !canCalculateBazi(compatReportRightRecord.form)) && (
+                <div className="mb-4 rounded-md border border-amber-200 bg-amber-50 p-4 text-sm leading-6 text-amber-900">
+                  当前合盘包含未知出生信息，固定规则部分会按“信息不足”处理，AI 解盘也会基于已知信息保守解读。
+                </div>
+              )}
               <h2 className="text-2xl font-semibold">双方命盘</h2>
               <div className="mt-4 grid gap-3 md:grid-cols-2">
                 {[compatReportLeftRecord, compatReportRightRecord].map((record) => {
@@ -1269,6 +1720,23 @@ export default function Home() {
                 })}
               </div>
             </section>
+
+            <AiReadingPanel
+              canSave={Boolean(compatReportLeftRecord && compatReportRightRecord)}
+              content={aiReading.scope === "compatibility" ? aiReading.content : ""}
+              quotaText={aiQuotaText}
+              isLoading={isAiReadingLoading && aiReading.scope === "compatibility"}
+              isSaving={isAiReadingSaving && aiReading.scope === "compatibility"}
+              onGenerate={() => handleAiReading("compatibility")}
+              onSave={() => handleSaveAiReading("compatibility")}
+              saveLabel={aiReading.scope === "compatibility" && aiReading.savedAt ? "更新 AI 解盘" : "保存 AI 解盘"}
+              saveTitle={
+                aiReading.scope === "compatibility" && aiReading.savedAt
+                  ? `已保存过合盘 AI 解盘，最近更新于 ${formatSavedTime(aiReading.savedAt)}。`
+                  : "当前合盘来自两条已保存命盘，可以保存这次 AI 解盘。"
+              }
+              status={aiReading.scope === "compatibility" ? aiReading.status : ""}
+            />
 
             <section className="rounded-lg border border-stone-300 bg-white p-5 shadow-sm">
               <h2 className="text-2xl font-semibold">日主关系</h2>
